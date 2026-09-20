@@ -503,6 +503,8 @@
     { r:'fwd', x: 0.00, y:0.84 }
   ];
 
+  // How long after winning the ball a side is still treated as breaking.
+  const COUNTER_MS = 5000;
   const SHAPES = {
     low:      { line:-0.115, press:0.55, chase:1 },
     balanced: { line: 0.000, press:1.00, chase:2 },
@@ -1133,7 +1135,7 @@
 
   const blankStat = ()=> ({ pass:0, shot:0, target:0, poss:0, tackle:0 });
   // what the CPU decided to do each time it looked up, for tuning
-  const DEC = { pass:0, shoot:0, carry:0, clear:0, cross:0, square:0, outlet:0, none:0 };
+  const DEC = { pass:0, shoot:0, carry:0, clear:0, cross:0, square:0, outlet:0, through:0, none:0 };
 
   function newMatch(){
     const H = makeTeam('home', home, '#4E6BE8');
@@ -1412,7 +1414,7 @@
       if(p.role === 'fwd'){
         // run the channel, ahead of the ball, away from the nearest defender —
         // and on a turnover, go now rather than waiting to be found
-        const breaking = performance.now() - M.turnover < 2000;
+        const breaking = performance.now() - M.turnover < COUNTER_MS;
         tx = p.channel * (SQUAD === 11 ? 13 : 12) + b.pos.x * 0.22;
         ty = yOfAdv(t, clamp(adv + (breaking ? 0.42 : 0.30), 0.50, 0.94));
         let near = null, bd = 9;
@@ -1985,11 +1987,63 @@
     const ownThird = advOf(t, c.pos.y) < 0.34;
     const pinned = c.role !== 'gk' && ownThird && press > 0.45;
 
+    // ---- the ball in behind ----
+    // They could walk it to the last defender and no further. Every legal
+    // receiver is level with or behind the ball, so against a set line there is
+    // simply nobody to pass to that gains anything — which is why fifty-two
+    // measured attacks reached the edge of the area and none reached the box.
+    // The way past a deep line is not a better pass to feet, it is a ball into
+    // the space behind with somebody running onto it. He is onside when it
+    // leaves the foot, which is the only moment the law cares about.
+    if(advOf(t, c.pos.y) > 0.30 && Math.random() < 0.5){
+      const line = offsideAdv(t);
+      let runner = null, spot = null, bestGap = 0.5;
+      for(const m of t.players){
+        if(m === c || m.role === 'gk') continue;
+        const a = advOf(t, m.pos.y);
+        // He holds the line, so he sits within a whisker of it either way —
+        // the first version of this test wanted him strictly behind it and
+        // therefore never found anybody at all.
+        if(a < line - 0.26 || a > line + 0.03) continue;
+        const d = dist(m.pos, c.pos);
+        if(d < 6 || d > 34) continue;
+        // Not so deep that the keeper simply walks out and picks it up.
+        const to = { x: clamp(m.pos.x * 0.65, -P.boxW / 2, P.boxW / 2),
+                     y: yOfAdv(t, Math.min(line + 0.18, 0.86)) };
+        // Whether he gets there first is a question about the defenders. The
+        // keeper is nearer to every ball played in behind than anybody on the
+        // pitch, so counting him made the answer no, always, and this never
+        // played once in thirty looks. Him sweeping it up is the risk you take.
+        let theirs = 99;
+        for(const o of otherTeam(t).players)
+          if(o.role !== 'gk') theirs = Math.min(theirs, dist(o.pos, to));
+        const gap = theirs - dist(m.pos, to);
+        if(gap > bestGap){ bestGap = gap; runner = m; spot = to; }
+      }
+      if(runner){
+        // same offside bookkeeping passTo does, since this bypasses it
+        for(const m of t.players) m.off = m !== c && advOf(t, m.pos.y) > line;
+        DEC.through++;
+        M.stat[t.side].pass++;
+        kick(c.pos, spot, 24, runner);
+        M.dribbling = false; M.dribbleFor = 0; M.run = null;
+        return;
+      }
+    }
+
     // The first two seconds after winning it are when a defence is out of
     // shape, and they were being spent playing sideways. On the counter they
     // look for the furthest man forward and hit him, even if he is marked —
     // a ball that arrives late is worth nothing.
-    const counter = performance.now() - M.turnover < 2000 && advOf(t, c.pos.y) < 0.55;
+    // A break is the one mode they attack properly in — it weights forward
+    // progress six times higher than ordinary build-up, and it is how the good
+    // goals happen. It used to last two seconds and switch off the moment the
+    // carrier crossed halfway, which is exactly when a counter should be
+    // accelerating: the window shut mid-move and they went back to knocking it
+    // square. Five seconds is about how long it takes to go from winning it in
+    // midfield to the edge of the box, and there is no longer a line across the
+    // pitch where the urgency stops.
+    const counter = performance.now() - M.turnover < COUNTER_MS;
 
     let best = null, score = -1e9;
     let safe = null, safeRoom = 0;
