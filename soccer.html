@@ -50,8 +50,13 @@
     --r-btn:8px;     /* buttons and selects */
   }
   *{box-sizing:border-box; -webkit-tap-highlight-color:transparent;}
-  .act,.shape button,.btn,.home,.picker,.score,.tip{
-    -webkit-user-select:none; user-select:none; -webkit-touch-callout:none;}
+  /* Nothing in this page is text you would want to copy, and a long press on
+     the pitch was selecting the canvas itself: grey handles at two corners, a
+     tint over the whole field and iOS's Copy / Translate menu sat on top of the
+     scoreboard mid-match. Selection is off everywhere; only the search box in
+     the picker takes it back, because you type there. */
+  html,body,body *{-webkit-user-select:none; user-select:none; -webkit-touch-callout:none;}
+  input,textarea{-webkit-user-select:text; user-select:text; -webkit-touch-callout:default;}
   html,body{margin:0; background:var(--bg); color:var(--text);
     font-family:'Work Sans',ui-rounded,system-ui,-apple-system,sans-serif;
     -webkit-font-smoothing:antialiased; overscroll-behavior:none;
@@ -516,7 +521,12 @@
   // reason they could be six down and still defending as though it were level.
   // A side that is losing pushes up and hunts it; a side that is winning late
   // sits in. The scoreline is doing what the button does for you.
+  let CPU_FORCE = null;          // test hook only; nothing in the game sets it
+  // How close to the ball's line a man has to be to block a pass in the first
+  // metres after it is struck. Exposed to the test hook so it can be measured.
+  const TUNE = { early: 0.7, hoof: 1, gk: 1, clearAim: 1 };
   function cpuShape(){
+    if(CPU_FORCE) return CPU_FORCE;
     if(!M) return 'balanced';
     const by = M.score.away - M.score.home;
     const late = M.half === 2 && M.clock > HALF_MS * 0.45;
@@ -529,6 +539,8 @@
     ? { gk:5.4, def:6.9, mid:7.1, fwd:7.4 }
     : { gk:4.4, def:5.5, mid:5.7, fwd:5.9 };
   const ACCEL = 13;
+  // How far behind the halfway line each role lines up for a kick-off.
+  const KICKOFF_DEPTH = { gk:0, def:20, mid:9, fwd:1.5 };
 
   // Two pools, and everything at once. English sides are their nickname or
   // their crest, not their colours, wherever there is one that reads.
@@ -1099,6 +1111,24 @@
   // lane that is open along its whole length, and hit it far enough to clear
   // the press.
   function clearTo(c, t){
+    // A clearance with nobody on the end of it is a turnover. If there is a man
+    // upfield with room, the long ball goes to him instead of to empty grass.
+    if(TUNE.clearAim){
+      let tgt = null, tb = 5;
+      for(const m of t.players){
+        if(m === c || m.role === 'gk') continue;
+        if(advOf(t, m.pos.y) - advOf(t, c.pos.y) < 0.10 || dist(m.pos, c.pos) > 48) continue;
+        let cv = 99, lane = 99;
+        for(const o of otherTeam(t).players){
+          if(o.role === 'gk') continue;
+          cv = Math.min(cv, dist(o.pos, m.pos));
+          lane = Math.min(lane, toPath(o.pos, c.pos, m.pos));
+        }
+        if(lane < 2.2) continue;
+        if(cv > tb){ tb = cv; tgt = m; }
+      }
+      if(tgt){ passTo(tgt); return; }
+    }
     let best = null, bestGap = -1;
     for(const a of [0.46, 0.56, 0.66])
       for(const sx2 of [-1, -0.5, 0.5, 1]){
@@ -1135,7 +1165,7 @@
 
   const blankStat = ()=> ({ pass:0, shot:0, target:0, poss:0, tackle:0 });
   // what the CPU decided to do each time it looked up, for tuning
-  const DEC = { pass:0, shoot:0, carry:0, clear:0, cross:0, square:0, outlet:0, through:0, none:0 };
+  const DEC = { pass:0, shoot:0, carry:0, clear:0, cross:0, square:0, outlet:0, through:0, none:0, gkShort:0, gkLong:0, hoof:0 };
 
   function newMatch(){
     const H = makeTeam('home', home, '#4E6BE8');
@@ -1512,7 +1542,35 @@
     }
   }
 
-  function thinkAll(){ for(const p of M.all) think(p); }
+  function thinkAll(){
+    for(const p of M.all) think(p);
+    // Law 8: at a kick-off everyone except the player taking it must be in
+    // their own half. This has to sit out here rather than inside think(),
+    // because several of the role branches set a target and return early —
+    // one midfielder was being sent to y=55, eighteen metres the wrong side of
+    // the line, and never saw the restart rules at all. Every path ends up
+    // here, so this is the one place the law can actually be enforced.
+    if((M.phase === 'break' || M.phase === 'kickoff')
+       && M.standOff && M.standOff.circle){
+      const half = P.h / 2;
+      for(const p of M.all){
+        if(p === M.ball.owner) continue;          // the taker may stand on the line
+        const line = p.team.dir > 0 ? half - 0.6 : half + 0.6;
+        // Clamping everyone to the line itself was legal and awful to watch: the
+        // shape wants three of the four outfielders upfield, so all three ended
+        // up in a row on the halfway line and every restart became an eight-second
+        // scrum in the centre circle. A real side lines up in DEPTH behind the
+        // ball, so each role gets its own set-back and the shape survives.
+        const back = KICKOFF_DEPTH[p.role] || 0;
+        const lim = line - p.team.dir * back;
+        p.target.y = p.team.dir > 0 ? Math.min(p.target.y, lim)
+                                    : Math.max(p.target.y, lim);
+        // Anyone actually over the line is held at it — but at the line, not at
+        // his set-back, so he walks into shape instead of being yanked backwards.
+        p.pos.y = p.team.dir > 0 ? Math.min(p.pos.y, line) : Math.max(p.pos.y, line);
+      }
+    }
+  }
 
   function step(dt){
     for(const p of M.all){
@@ -1597,7 +1655,14 @@
     b.vel.x *= drag; b.vel.y *= drag;
     b.loose -= dt;
     if(outOfPlay()) return;
-    if(b.loose > 0) return;
+    // The 0.3s after a kick is there so the kicker does not trap his own pass.
+    // It was stopping EVERYONE touching it — six metres of untouchable flight,
+    // which is exactly where the man closing you down stands. Pressing could
+    // never win the ball: you tapped a teammate and it went straight through
+    // him. Now only the kicker's own side waits; an opponent in the way can
+    // step in, as long as it is a pass and not a shot.
+    const early = b.loose > 0;
+    if(early && !(TUNE.early && !M.shot && b.kicker && b.loose < 0.26)) return;
 
     // Belt and braces: a ball that has sat still with nobody on it for a couple
     // of seconds is a stuck match, whatever the cause. Give it to whoever is
@@ -1617,9 +1682,12 @@
     const reach = clamp(2.2 - pace * 0.095, 0.55, 2.2);
     let best = null, bd = 0;
     for(const p of M.all){
+      if(early && p.team === b.kicker.team) continue;
       // a keeper who has been beaten cannot scoop it up on the way past either
       if(p.role === 'gk' && M.shot && M.shot.team !== p.team && M.shot.beat) continue;
-      const mine = p === b.to ? 2.4 : reach;
+      // In those first metres it has to go more or less through him: a pass
+      // at the man closing you down is blocked, one played round him is not.
+      const mine = p === b.to ? 2.4 : early ? TUNE.early : reach;
       const d = dist(p.pos, b.pos);
       if(d < mine && (!best || d < bd)){ bd = d; best = p; }
     }
@@ -1713,6 +1781,7 @@
 
   function kick(from, to, speed, forWhom){
     const b = M.ball;
+    b.kicker = b.owner;
     b.to = forWhom || null;
     // Any kick cancels the last shot. Without this, a shot's "the keeper is
     // beaten" verdict was still standing when you played it back to your own
@@ -2095,7 +2164,7 @@
       for(const o of otherTeam(t).players)
         if(o.role !== 'gk') hunted = Math.min(hunted, dist(o.pos, c.pos));
 
-      let open = null, room = 13;
+      let open = null, room = TUNE.gk ? 0 : 13;
       for(const m of t.players){
         if(m === c) continue;
         let cover = 99;
@@ -2105,13 +2174,21 @@
           if(o.role === 'gk') continue;
           lane = Math.min(lane, toPath(o.pos, c.pos, m.pos));
         }
-        if(lane < 5.5) continue;
+        if(lane < (TUNE.gk ? 3.5 : 5.5)) continue;
         // deep in his own end a man needs to be properly clear, not just clear
         const deep = advOf(t, m.pos.y) < 0.30;
-        if(cover > (deep ? 17 : room) && cover > room){ room = cover; open = m; }
+        // He only ever threw it out to a man with thirteen to seventeen metres
+        // of grass round him, and only with nobody inside twenty of himself —
+        // which in five-a-side is never. So every save and every goal kick went
+        // long, and a long ball in this game is a gift: it was the top cause of
+        // them losing the ball once the punts from midfield were fixed. Seven
+        // metres of room and an open lane is plenty to roll it out.
+        const need = TUNE.gk ? (deep ? 8 : 7) : (deep ? 17 : 13);
+        if(cover > need && cover > room){ room = cover; open = m; }
       }
       // if they are hunting him, it goes long whatever the options look like
-      if(open && hunted > 20) return passTo(open);
+      if(open && hunted > (TUNE.gk ? 7 : 20)){ DEC.gkShort++; return passTo(open); }
+      DEC.gkLong++;
       clearTo(c, t);
       return;
     }
@@ -2125,8 +2202,29 @@
     if(pinned && !safe && !best){ DEC.clear++; clearTo(c, t); return; }
     let room = 99;
     if(best) for(const o of otherTeam(t).players) room = Math.min(room, dist(o.pos, best.pos));
-    if(best && room < (ownThird ? 6.0 : 2.2)){
-      // nobody worth finding: put it forward rather than into a tackle
+    // This was the biggest single way they gave the ball away. In their own
+    // third, a receiver with anyone inside six metres of him counted as "nobody
+    // worth finding", and the ball was punted to a random spot upfield with no
+    // one aimed at — which in five-a-side is nearly every time, since the lane
+    // to him had already been checked clear. Five of nine turnovers were this.
+    // Now it only goes long when he is actually hemmed in AND the man is tight,
+    // and when it does go long it goes to somebody.
+    const hoof = TUNE.hoof
+      ? best && pinned && room < 3.0
+      : best && room < (ownThird ? 6.0 : 2.2);
+    if(hoof){
+      DEC.hoof++;
+      let tgt = null, tb = -1e9;
+      if(TUNE.hoof) for(const m of t.players){
+        if(m === c || m.role === 'gk') continue;
+        const ahead = advOf(t, m.pos.y) - advOf(t, c.pos.y);
+        if(ahead < 0.12 || dist(m.pos, c.pos) > 45) continue;
+        let cv = 99;
+        for(const o of otherTeam(t).players) if(o.role !== 'gk') cv = Math.min(cv, dist(o.pos, m.pos));
+        const sc = cv * 1.5 + ahead * 20;
+        if(sc > tb){ tb = sc; tgt = m; }
+      }
+      if(tgt){ passTo(tgt); return; }
       kick(c.pos, { x: clamp(c.pos.x + rnd(-14, 14), -P.w/2 + 3, P.w/2 - 3), y: yOfAdv(t, 0.62) }, 25);
       return;
     }
@@ -2500,6 +2598,30 @@
     }
     if(M.phase === 'kickoff' && M.kickTeam.side === 'away' && performance.now() > M.hold){
       M.phase = 'live';
+      // Law 8 binds them too: the taker cannot play it a second time before
+      // somebody else has touched it, so theirs has to be passed rather than
+      // carried away. Yours is refused at the swipe; theirs is simply played.
+      const taker = M.ball.owner;
+      if(taker && taker.team.side === 'away'){
+        // Picking the NEAREST teammate meant playing it five metres square into
+        // the four opponents standing on the line — the ball came straight back
+        // and the restart died on the spot. Nobody kicks off forwards. Play it
+        // to whoever has the most room, and pay for going backwards to get it.
+        const t = M.teams.away;
+        let mate = null, best = -1e9;
+        for(const q of t.players){
+          if(q === taker || q.role === 'gk') continue;
+          const d = dist(q.pos, taker.pos);
+          if(d < 4 || d > 26) continue;
+          let room = 99;
+          for(const o of M.teams.home.players)
+            if(o.role !== 'gk') room = Math.min(room, dist(o.pos, q.pos));
+          const backwards = (q.pos.y - taker.pos.y) * t.dir < 0;
+          const s = room * 1.6 + (backwards ? 7 : 0) - d * 0.15;
+          if(s > best){ best = s; mate = q; }
+        }
+        if(mate) passTo(mate);
+      }
       $('tip').textContent = 'Swipe to run \u00b7 tap a teammate to pass \u00b7 tap the goal to shoot';
     }
 
@@ -2772,6 +2894,18 @@
       e.preventDefault();
     lastEnd = now; lastX = x; lastY = y;
   }, { passive:false });
+  // CSS alone has not always been enough in an in-app browser: a long press
+  // still starts a selection there. Cancelling the touch on the pitch itself
+  // stops it at the source. The game reads pointer events, which a cancelled
+  // touchstart does not suppress, so play is unaffected.
+  $('stage').addEventListener('touchstart', e => { if(e.cancelable) e.preventDefault(); },
+    { passive:false });
+  ['selectstart','contextmenu'].forEach(g =>
+    document.addEventListener(g, e => {
+      const el = e.target;
+      if(el && el.closest && el.closest('input,textarea')) return;
+      e.preventDefault();
+    }));
   // Pinching the pitch mid-match is never the intent either.
   ['gesturestart','gesturechange','gestureend'].forEach(g =>
     cv.addEventListener(g, e => e.preventDefault()));
@@ -2905,6 +3039,8 @@
       decisions: ()=> DEC,
       state: ()=> M,
       cpuShape: ()=> cpuShape(),
+      forceShape: s => { CPU_FORCE = s; },
+      tune: TUNE,
       toScreen: (x, y) => ({ x: sx(x), y: sy(y) }),
       pass: p => passTo(p), shoot: ()=> shoot(),
       setDribble: v => { M.dribbling = v; }
