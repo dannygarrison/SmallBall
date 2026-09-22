@@ -541,6 +541,11 @@
   const ACCEL = 13;
   // How far behind the halfway line each role lines up for a kick-off.
   const KICKOFF_DEPTH = { gk:0, def:20, mid:9, fwd:1.5 };
+  // Law 12 as it stands from July 2025: a keeper may hold the ball in his hands
+  // for eight seconds, the referee counts the last five down with his fingers,
+  // and going over is a corner to the other side. The same count stops you
+  // standing over one of your own restarts while the clock runs.
+  const HOLD_MS = 8000, COUNT_FROM_MS = 3000;
 
   // Two pools, and everything at once. English sides are their nickname or
   // their crest, not their colours, wherever there is one that reads.
@@ -1177,6 +1182,7 @@
       dribbling:false, dribbleFor:0, lastTouch:null, msg:0, shot:null, cpuThink:0,
       queued:null, tapFx:null, gkHold:0, phase:'kickoff', hold:0, run:null, turnover:0,
       standOff:null, kickTeam:null, added:0, addedSide:null, addedMins:0, addedUntil:0,
+      ext:null, extChecked:false, stopKind:'',
       turnAt:0,
       scorer:null, corner:null,
       goalFx:0,
@@ -1203,6 +1209,7 @@
     M.phase = 'break';
     M.hold = performance.now() + pauseMs;
     M.kickTeam = team;
+    M.stopKind = kind || '';
     M.dribbling = false; M.queued = null; M.run = null;
     if(msg) say(msg, pauseMs);
   }
@@ -1270,7 +1277,8 @@
     // A keeper on the ball cannot be tackled, so running at him achieves nothing
     // beyond dragging your whole team into his box. Everyone drops off instead,
     // which is also what happens while he decides between long and short.
-    if(carrier && carrier.role === 'gk') chase = 0;
+    // On a back-pass he has it at his feet, and then he is fair game.
+    if(carrier && carrier.role === 'gk' && M.gkHands) chase = 0;
 
     if(p.role === 'gk') return gkThink(p);
 
@@ -1345,7 +1353,7 @@
       const stay = mine === 'press' ? 0.60 : mine === 'low' ? 0.42 : 0.50;
       a = Math.max(a, stay);
     }
-    if(defending && carrier.role === 'gk'){
+    if(defending && carrier.role === 'gk' && M.gkHands){
       // Stand off while he has it, and stand off further in the first moment
       // after a catch, when he is still holding it and picking a target.
       const held = performance.now() < M.gkHold;
@@ -1708,6 +1716,8 @@
                    : rnd(0.35, 0.75) * (1 - 0.8 * squeeze);
       }
       b.owner = best; M.lastTouch = best; M.dribbleFor = 0;
+      if(best.role === 'gk') keeperGets(best);
+      b.kicker = null;                         // that kick has been dealt with
       clearFlags();
       // A pass asked for while the ball was still travelling. It only stands if
       // your man is the one who actually gets it — beat him to it and the
@@ -1753,19 +1763,37 @@
       }
   }
 
+  // Called whenever a keeper takes possession. A ball kicked to him by one of
+  // his own side is a back-pass: he may not pick it up, so he has it at his
+  // feet like anyone else — which means he can be pressed and tackled.
+  function keeperGets(gk){
+    const k = M.ball.kicker;
+    M.gkWho = gk;
+    M.gkSince = performance.now();
+    M.gkHands = !(k && k !== gk && k.team === gk.team);
+    M.countShown = 0;
+  }
+
   function tackleCheck(dt){
     const c = M.ball.owner;
-    if(!c || c.role === 'gk') return;
+    if(!c || (c.role === 'gk' && M.gkHands)) return;
     const opp = otherTeam(c.team);
     const sh = SHAPES[opp.side === 'home' ? shape : cpuShape()];
     for(const o of opp.players){
       if(o.role === 'gk') continue;
-      const d = dist(o.pos, c.pos);
+      // A keeper on a back-pass has the ball a stride in front of him, and the
+      // man closing him down goes for the ball. Measured only to the keeper,
+      // the presser stopped on the ball and was still 2.6m from the man.
+      const footKeeper = c.role === 'gk';
+      const d = footKeeper ? Math.min(dist(o.pos, c.pos), dist(o.pos, M.ball.pos))
+                           : dist(o.pos, c.pos);
       if(d > 2.1) continue;
       // Carrying it into contact is how you lose it, and holding longer raises
-      // the odds — that is the cost the dribble button needs to have.
+      // the odds — that is the cost the dribble button needs to have. A keeper
+      // standing on it with someone in his face is the same thing, only worse.
       const carried = c.team.side === 'home' && M.dribbling ? M.dribbleFor : 0;
-      if(Math.random() < (0.30 + carried * 0.40) * sh.press * (2.1 - d) * dt){
+      const stood = footKeeper ? 4 : 1;
+      if(Math.random() < (0.30 + carried * 0.40) * stood * sh.press * (2.1 - d) * dt){
         M.ball.owner = o; M.lastTouch = o; M.dribbleFor = 0; M.dribbling = false;
         M.queued = null; M.run = null;
         M.turnover = performance.now(); M.ball.lastSide = o.team.side;
@@ -2268,11 +2296,15 @@
       const beaten = M.shot && M.shot.team !== t && M.shot.beat;
       if(!out && !beaten && dist(gk.pos, b.pos) < 1.9){
         b.owner = gk; M.lastTouch = gk; M.dribbling = false;
+        keeperGets(gk);
+        b.kicker = null;
         // He has it in his hands. Nobody can do anything about that for a
         // moment, and pretending otherwise is why the ball kept coming straight
         // back — a keeper under pressure hurries it to the nearest man, who
         // happens to be the one stood on top of him.
-        M.gkHold = performance.now() + 1700;
+        // (Only when it is in his hands. On a back-pass he has it at his feet
+        // and nobody is obliged to give him a moment.)
+        M.gkHold = M.gkHands ? performance.now() + 1700 : 0;
         M.queued = null;
         if(M.shot && M.shot.team !== t){
           M.stat[M.shot.team.side].target++;       // he had to save it, so it was on
@@ -2573,6 +2605,59 @@
     sizeCanvas(); drawPitch(); drawPlayers(); drawCoach(); drawSwipe();
   }
 
+  // The referee's count. It shows the last five seconds, one number at a time.
+  function countDown(held){
+    if(held < COUNT_FROM_MS) return false;
+    const left = Math.ceil((HOLD_MS - held) / 1000);
+    if(left > 0 && left !== M.countShown){ M.countShown = left; say(String(left), 700); }
+    return held >= HOLD_MS;
+  }
+
+  // The clock runs through stoppages, so anything that lets a side stand still
+  // with the ball is a way to run it down. Passing it back to your keeper and
+  // sitting there did exactly that: he could not be tackled, nobody went near
+  // him, and there was no limit. Three holes, one count.
+  function holdCount(){
+    const now = performance.now();
+    const o = M.ball.owner;
+
+    // a keeper with the ball in his hands: eight seconds, then a corner
+    if(M.phase === 'live' && o && o.role === 'gk'){
+      if(o !== M.gkWho) keeperGets(o);
+      if(M.gkHands && countDown(now - M.gkSince)){
+        const end = o.team, hw = P.w / 2;
+        M.gkWho = null;
+        place(otherTeam(end), { x: Math.sign(o.pos.x || 1) * (hw - 0.6),
+                                y: end.dir > 0 ? 0.6 : P.h - 0.6 }, 'HELD IT · CORNER');
+        return;
+      }
+    } else if(!o || o.role !== 'gk') M.gkWho = null;
+
+    // your restarts: eight seconds, then the taker plays it himself. Kick-offs
+    // are left alone — the side taking one has just conceded and is in no hurry
+    // to waste time, and the very first one is when you are finding your feet.
+    if(M.phase === 'kickoff' && M.kickTeam.side === 'home' && M.standOff && !M.standOff.circle
+       && o && o.team.side === 'home'){
+      if(!M.restartAt){ M.restartAt = now; M.countShown = 0; }
+      if(countDown(now - M.restartAt)){
+        let mate = null, best = -1e9;
+        for(const q of M.teams.home.players){
+          if(q === o || q.role === 'gk') continue;
+          let room = 99;
+          for(const e of M.teams.away.players)
+            if(e.role !== 'gk') room = Math.min(room, dist(e.pos, q.pos));
+          const s2 = room - dist(q.pos, o.pos) * 0.12;
+          if(s2 > best){ best = s2; mate = q; }
+        }
+        if(mate){
+          M.phase = 'live'; M.restartAt = 0;
+          $('tip').textContent = 'Swipe to run \u00b7 tap a teammate to pass \u00b7 tap the goal to shoot';
+          passTo(mate);
+        }
+      }
+    } else M.restartAt = 0;
+  }
+
   let last = 0;
   function tick(now){
     raf = requestAnimationFrame(tick);
@@ -2625,6 +2710,7 @@
       $('tip').textContent = 'Swipe to run \u00b7 tap a teammate to pass \u00b7 tap the goal to shoot';
     }
 
+    holdCount();
     if(M.phase !== 'paused') M.clock += dt * 1000;   // runs through stoppages, as it does in life
     if(M.ball.owner) M.stat[M.ball.owner.team.side].poss++;
 
@@ -2664,31 +2750,38 @@
     const holder = M.ball.owner ? M.ball.owner.team.side
                  : (M.lastTouch ? M.lastTouch.team.side : null);
     const played = M.added && performance.now() > M.addedUntil;
-
-    // A tackle is not the end of anything — possession changes hands every few
-    // seconds in a scramble, so blowing on the first touch by the other side
-    // ended the half mid-passage almost every time. The move has to actually be
-    // over: they have to hold it for a moment, or the ball has to go dead.
-    if(M.added){
-      if(holder && M.addedSide && holder !== M.addedSide){
-        if(!M.turnAt) M.turnAt = performance.now();
-      } else {
-        M.turnAt = 0;                                 // won straight back
-      }
-    }
-    const settled = M.turnAt && performance.now() - M.turnAt > 1400;
-    // The ball being dead is the commonest way a half ends, and it was the one
-    // case that could never fire: the test asked for a dead ball while the
-    // surrounding branch demanded a live one. Worse, a throw-in awarded to you
-    // after time was up left the half waiting on a restart it would not accept,
-    // so it never ended at all.
     const dead = M.phase === 'break' || M.phase === 'kickoff';
     const canEnd = dead || M.phase === 'live';       // never mid-goal or paused
-    const overdue = played && (
-      dead ||                                        // the ball has gone out
-      settled ||                                     // the move has broken down
-      performance.now() - M.addedUntil > 9000        // seen enough
-    );
+    const setPieceFor = side => dead && M.kickTeam && M.kickTeam.side === side
+                                && /CORNER|FREE KICK/.test(M.stopKind || '');
+
+    // When the added time is up, a side attacking in the other half gets to
+    // finish the move. The referee does not blow with a team bearing down on
+    // goal. The half ends when that attack is over, and only then: the other
+    // side wins it (a tackle, an interception, the keeper claiming it), the
+    // ball goes out, a goal is scored, or they take it back into their own half.
+    // A corner or free kick they win is still taken. There used to be a
+    // nine-second cut-off on top of this, and that was the abrupt whistle.
+    let overdue = false;
+    if(played && canEnd){
+      if(!M.extChecked){
+        M.extChecked = true;
+        const side = dead ? (M.kickTeam && M.kickTeam.side) : holder;
+        const team = side ? M.teams[side] : null;
+        const upfield = team && advOf(team, M.ball.pos.y) > 0.5;
+        M.ext = team && upfield && (M.phase === 'live' || setPieceFor(side)) ? side : null;
+      }
+      if(!M.ext){ overdue = true; M.endWhy = 'no attack on'; }       // nobody attacking: blow now
+      else if(M.phase === 'live'){
+        // Possession means having it, not touching it: a block or a deflection
+        // behind is not the other side winning the ball, and a corner off one
+        // still gets taken. And a pass back is judged where it is received, not
+        // the moment it rolls over the line.
+        const o = M.ball.owner;
+        if(o && o.team.side !== M.ext){ overdue = true; M.endWhy = 'won by ' + o.team.side + ' ' + o.role; }
+        else if(o && advOf(M.teams[M.ext], o.pos.y) < 0.5){ overdue = true; M.endWhy = 'back in own half'; }
+      } else if(!setPieceFor(M.ext)){ overdue = true; M.endWhy = 'dead: ' + (M.stopKind || M.phase); } // out, or a goal
+    }
 
     if(canEnd && overdue){
       if(M.half === 1){
@@ -2711,6 +2804,7 @@
           showStats('half');
         }, 1900);
         M.clock = 0; M.added = 0; M.addedSide = null; M.addedUntil = 0; M.turnAt = 0;
+        M.ext = null; M.extChecked = false;
       } else {
         M.running = false; M.phase = 'done';
         const sc = M.score;
